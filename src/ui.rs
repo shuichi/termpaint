@@ -1,6 +1,7 @@
-//! Text UI (toolbar, palette, layer list, status bar, popups) built with
-//! ratatui. The canvas area is left as empty default-background cells; the
-//! Kitty image placed underneath shows through there.
+//! Text UI (toolbar, colour picker labels, layer list, status bar, popups)
+//! built with ratatui. The canvas and the colour picker's interior are left
+//! as default-background cells; the Kitty images placed underneath show
+//! through there.
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -9,13 +10,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
-use crate::app::{Action, App, PALETTE, Popup, Slider, Tool, hsv_to_rgb, palette_color};
-use crate::document::Rgba;
+use crate::app::{ALPHA_PRESETS, Action, App, Popup, Tool};
+use crate::picker;
 
 const BG: Color = Color::Rgb(24, 25, 31);
-const PANEL: Color = Color::Rgb(32, 34, 42);
+pub const PANEL: Color = Color::Rgb(32, 34, 42);
 const BTN: Color = Color::Rgb(52, 55, 68);
-const ACCENT: Color = Color::Rgb(94, 129, 244);
+pub const ACCENT: Color = Color::Rgb(94, 129, 244);
 const FG: Color = Color::Rgb(222, 224, 232);
 const DIM: Color = Color::Rgb(135, 140, 158);
 const ROW_SEL: Color = Color::Rgb(56, 64, 96);
@@ -26,41 +27,33 @@ const HOVER: Color = Color::Rgb(74, 80, 104);
 
 const COPYRIGHT: &str = "(c) Shuichi Kurabayashi";
 
-const LEFT_W: u16 = 28;
-const RIGHT_W: u16 = 30;
+const RIGHT_W: u16 = 36;
+/// The layers panel keeps at least this many rows (3 list rows); the
+/// colour panel above it gets the rest, up to what the picker wants.
+const LAYERS_MIN_H: u16 = 10;
 const TOOLBAR_H: u16 = 2;
 /// Height of the About icon in text rows, so it scales with the font.
 const ICON_ROWS: u16 = 6;
 
 pub struct Areas {
     pub toolbar: Rect,
-    pub left: Rect,
     pub canvas_block: Rect,
     pub canvas: Rect,
-    pub right: Rect,
+    pub colors: Rect,
+    pub layers: Rect,
     pub status: Rect,
 }
 
-pub fn areas(full: Rect) -> Areas {
+/// Screen layout; `cell` (pixels) decides how tall the colour picker is.
+pub fn areas(full: Rect, cell: (u32, u32)) -> Areas {
     let [toolbar, main, status] =
         Layout::vertical([Constraint::Length(TOOLBAR_H), Constraint::Min(3), Constraint::Length(1)]).areas(full);
-    let [left, canvas_block, right] =
-        Layout::horizontal([Constraint::Length(LEFT_W), Constraint::Min(4), Constraint::Length(RIGHT_W)]).areas(main);
+    let [canvas_block, right] = Layout::horizontal([Constraint::Min(4), Constraint::Length(RIGHT_W)]).areas(main);
+    let want = picker::rows_for(RIGHT_W - 2, cell) + 2;
+    let colors_h = want.min(right.height.saturating_sub(LAYERS_MIN_H));
+    let [colors, layers] = Layout::vertical([Constraint::Length(colors_h), Constraint::Min(0)]).areas(right);
     let canvas = Block::bordered().inner(canvas_block);
-    Areas { toolbar, left, canvas_block, canvas, right, status }
-}
-
-fn to_color(c: Rgba) -> Color {
-    Color::Rgb(c.0[0], c.0[1], c.0[2])
-}
-
-fn contrast(c: Color) -> Color {
-    if let Color::Rgb(r, g, b) = c
-        && 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32 > 140.0
-    {
-        return Color::Black;
-    }
-    Color::White
+    Areas { toolbar, canvas_block, canvas, colors, layers, status }
 }
 
 /// Inline element of the property strip.
@@ -127,15 +120,15 @@ impl<'a> Row<'a> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let a = areas(f.area());
+    let a = areas(f.area(), app.cell);
     app.canvas_cells = a.canvas;
     app.about_icon = None;
     app.hits.clear();
     let buf = f.buffer_mut();
 
     draw_toolbar(buf, app, a.toolbar);
-    draw_colors(buf, app, a.left);
-    draw_layers(buf, app, a.right);
+    draw_colors(buf, app, a.colors);
+    draw_layers(buf, app, a.layers);
     draw_canvas_frame(buf, app, a.canvas_block);
     draw_status(buf, app, a.status);
     if app.popup.is_some() {
@@ -149,7 +142,8 @@ fn draw_hover(buf: &mut Buffer, app: &App) {
     let Some(pos) = app.hover else { return };
     let Some((r, a)) = app.hits.iter().rev().find(|(r, _)| r.contains(pos)) else { return };
     let skip = match a {
-        Action::Slider(_) | Action::Swatch(_) | Action::LayerSelect(_) => true,
+        // The picker highlights its own buttons in its bitmap.
+        Action::LayerOpacity | Action::LayerSelect(_) | Action::Picker => true,
         Action::Tool(t) => *t == app.tool,
         _ => false,
     };
@@ -255,111 +249,56 @@ fn panel_block(title: &str) -> Block<'_> {
         .style(Style::new().bg(PANEL).fg(FG))
 }
 
+/// The colour picker: a Kitty bitmap under default-background cells (see
+/// `picker`), with the numbers drawn here as text on top of it.
 fn draw_colors(buf: &mut Buffer, app: &mut App, area: Rect) {
     use ratatui::widgets::Widget;
     let block = panel_block("Colors");
     let inner = block.inner(area);
     block.render(area, buf);
-    if inner.height < 4 {
+    app.picker = picker::Layout::new(inner, app.cell);
+    let Some(l) = app.picker else {
+        // Too small for the picker: a hidden hex field must not keep the keyboard.
+        app.hex_edit = None;
         return;
-    }
-    let mut y = inner.y;
-    let bottom = inner.y + inner.height;
+    };
+    buf.set_style(inner, Style::reset());
+    app.hits.push((inner, Action::Picker));
 
-    for (label, c) in [("Primary  ", app.primary), ("Secondary", app.secondary)] {
-        let mut row = Row::new(buf, &mut app.hits, inner, y);
-        row.text(&format!(" {label} "), Style::new().fg(DIM));
-        row.text("      ", Style::new().bg(to_color(c)));
-        row.text(&format!(" {}", c.hex()), Style::new().fg(FG));
-        y += 1;
+    let label = Style::new().fg(FG);
+    let (h, s, lum) = app.hsl_readout();
+    for (r, t) in l.hsl.iter().zip([format!("H: {h}"), format!("S: {s}"), format!("L: {lum}")]) {
+        buf.set_stringn(r.x, r.y, t, r.width as usize, label);
     }
-    {
-        let mut row = Row::new(buf, &mut app.hits, inner, y);
-        row.gap(1);
-        row.button(" ⇄ Swap (x) ", false, Action::Swap);
-        y += 2;
-    }
-
-    // Palette grid: 8 swatches per row, 3 cells each (2 colour + 1 gap).
-    let per_row = 8usize;
-    for (i, _) in PALETTE.iter().enumerate() {
-        let r = (i / per_row) as u16;
-        let c = (i % per_row) as u16;
-        let yy = y + r;
-        if yy >= bottom {
-            break;
+    buf.set_string(l.hex_label.x, l.hex_label.y, "#:", label);
+    let (x, y, n) = (l.hex.x + 1, l.hex.y, l.hex.width as usize - 1);
+    let value = Style::new().fg(Color::White);
+    match &app.hex_edit {
+        // Nothing typed yet: the current value is a placeholder.
+        Some(t) if t.is_empty() => {
+            buf.set_string(x, y, "▏", value);
+            buf.set_stringn(x + 1, y, &app.primary.hex()[1..7], n - 1, Style::new().fg(DIM));
         }
-        let x = inner.x + 1 + c * 3;
-        let col = palette_color(i);
-        let mark = if col == app.primary { "▪▪" } else { "  " };
-        let color = to_color(col);
-        buf.set_string(x, yy, mark, Style::new().bg(color).fg(contrast(color)));
-        app.hits.push((Rect::new(x, yy, 2, 1), Action::Swatch(i)));
-    }
-    y += PALETTE.len().div_ceil(per_row) as u16 + 1;
-
-    // Colour sliders with live gradients.
-    let bar_w = inner.width.saturating_sub(8);
-    let sliders = [
-        ("R", Slider::R),
-        ("G", Slider::G),
-        ("B", Slider::B),
-        ("A", Slider::A),
-        ("H", Slider::H),
-        ("S", Slider::S),
-        ("V", Slider::V),
-    ];
-    for (i, (label, s)) in sliders.into_iter().enumerate() {
-        if i == 4 {
-            y += 1;
+        Some(t) => {
+            buf.set_stringn(x, y, format!("{t}▏"), n, value);
         }
-        if y >= bottom {
-            break;
+        None => {
+            buf.set_stringn(x, y, &app.primary.hex()[1..7], n, value);
         }
-        buf.set_string(inner.x + 1, y, label, Style::new().fg(DIM));
-        let bar = Rect::new(inner.x + 3, y, bar_w, 1);
-        draw_gradient(buf, app, s, bar);
-        app.hits.push((bar, Action::Slider(s)));
-        let v = app.slider_value(s);
-        let txt = if s == Slider::H { format!("{:>3}°", (v * 360.0).round()) } else { format!("{:>4}", (v * 255.0).round()) };
-        buf.set_string(bar.x + bar.width, y, txt, Style::new().fg(FG));
-        y += 1;
     }
+    buf.set_string(l.alpha_label.x, l.alpha_label.y, "Opacity", label);
+    buf.set_string(l.alpha.x + 1, l.alpha.y, format!("{:>3} %", app.alpha_percent()), value);
 }
 
-fn draw_gradient(buf: &mut Buffer, app: &App, s: Slider, bar: Rect) {
+/// Layer opacity bar: filled up to the value, with a marker.
+fn draw_opacity_bar(buf: &mut Buffer, value: f32, bar: Rect) {
     let n = bar.width.max(1);
-    let value = app.slider_value(s);
     let marker = ((value * n as f32) as u16).min(n - 1);
     for i in 0..n {
         let t = (i as f32 + 0.5) / n as f32;
-        let mut c = app.primary;
-        let color = match s {
-            Slider::R => {
-                c.0[0] = (t * 255.0) as u8;
-                to_color(c)
-            }
-            Slider::G => {
-                c.0[1] = (t * 255.0) as u8;
-                to_color(c)
-            }
-            Slider::B => {
-                c.0[2] = (t * 255.0) as u8;
-                to_color(c)
-            }
-            Slider::A => {
-                let v = (t * 255.0) as u8;
-                Color::Rgb(v, v, v)
-            }
-            Slider::H => to_color(hsv_to_rgb((t * 360.0, app.hsv.1.max(0.6), app.hsv.2.max(0.6)))),
-            Slider::S => to_color(hsv_to_rgb((app.hsv.0, t, app.hsv.2))),
-            Slider::V => to_color(hsv_to_rgb((app.hsv.0, app.hsv.1, t))),
-            Slider::LayerOpacity => {
-                if t <= value { ACCENT } else { BTN }
-            }
-        };
+        let color = if t <= value { ACCENT } else { BTN };
         let sym = if i == marker { "┃" } else { " " };
-        buf.set_string(bar.x + i, bar.y, sym, Style::new().bg(color).fg(contrast(color)));
+        buf.set_string(bar.x + i, bar.y, sym, Style::new().bg(color).fg(Color::White));
     }
 }
 
@@ -399,8 +338,8 @@ fn draw_layers(buf: &mut Buffer, app: &mut App, area: Rect) {
     buf.set_string(inner.x, y0, "─".repeat(inner.width as usize), Style::new().fg(DIM));
     buf.set_string(inner.x + 1, y0 + 1, "Opacity", Style::new().fg(DIM));
     let bar = Rect::new(inner.x + 9, y0 + 1, inner.width.saturating_sub(15), 1);
-    draw_gradient(buf, app, Slider::LayerOpacity, bar);
-    app.hits.push((bar, Action::Slider(Slider::LayerOpacity)));
+    draw_opacity_bar(buf, app.layer_opacity(), bar);
+    app.hits.push((bar, Action::LayerOpacity));
     let op = app.doc.layers[app.doc.active].opacity;
     buf.set_string(bar.x + bar.width, bar.y, format!("{op:>5}%"), Style::new().fg(FG));
 
@@ -597,6 +536,24 @@ fn draw_popup(f: &mut Frame, app: &mut App) {
             row.gap(1);
             row.button(" Cancel ", false, Action::PopupClose);
         }
+        Some(Popup::AlphaMenu) => {
+            // Dropped down from (or up over) the picker's menu button.
+            let Some(button) = app.picker.map(|l| l.menu) else { return };
+            let (w, h) = (9, ALPHA_PRESETS.len() as u16 + 2);
+            let x = button.right().saturating_sub(w);
+            let y = if button.bottom() + h <= full.bottom() { button.bottom() } else { button.y.saturating_sub(h) };
+            let r = Rect::new(x, y, w, h).intersection(full);
+            f.render_widget(Clear, r);
+            let b = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(ACCENT)).style(st);
+            let inner = b.inner(r);
+            f.render_widget(b, r);
+            let current = app.alpha_percent();
+            let buf = f.buffer_mut();
+            for (i, p) in ALPHA_PRESETS.into_iter().enumerate() {
+                let mut row = Row::new(buf, &mut app.hits, inner, inner.y + i as u16);
+                row.button(&format!(" {p:>3} % "), p == current, Action::Alpha(p));
+            }
+        }
         None => {}
     }
 }
@@ -724,6 +681,39 @@ mod tests {
         assert!(screen.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))));
         assert!(screen.contains("(c) Shuichi Kurabayashi"));
         assert!(app.hits.iter().any(|(_, a)| *a == Action::PopupClose), "OK button");
+    }
+
+    #[test]
+    fn right_pane_stacks_colors_over_layers() {
+        let a = areas(Rect::new(0, 0, 181, 49), (19, 42));
+        assert_eq!((a.colors.x, a.colors.width), (a.layers.x, RIGHT_W));
+        assert_eq!(a.colors.bottom(), a.layers.y);
+        assert_eq!(a.canvas_block.right(), a.colors.x, "no left pane");
+        assert_eq!(a.colors.height, picker::rows_for(RIGHT_W - 2, (19, 42)) + 2);
+        // Short terminals keep a usable layers panel.
+        let a = areas(Rect::new(0, 0, 100, 24), (19, 42));
+        assert!(a.layers.height >= LAYERS_MIN_H);
+    }
+
+    #[test]
+    fn picker_cells_let_the_bitmap_show_through() {
+        let mut app = App::new(Document::new(64, 64), "t.png".into(), (19, 42), 64);
+        let mut term = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let b = term.backend().buffer().clone();
+        let l = app.picker.expect("picker");
+        for p in l.area.positions() {
+            assert_eq!(b[p].bg, Color::Reset, "picker cell {p:?} must keep the default background");
+        }
+        let text = |r: Rect| (r.x..r.right()).map(|x| b[(x, r.y)].symbol().to_string()).collect::<String>();
+        assert_eq!(text(l.hsl[0]).trim_end(), "H: 0");
+        assert_eq!(text(l.hsl[2]).trim_end(), "L: 0");
+        assert_eq!(text(l.hex_label), "#:");
+        assert_eq!(text(l.hex).trim(), "000000");
+        assert_eq!(text(l.alpha).trim(), "100 %");
+        assert_eq!(text(l.alpha_label), "Opacity");
+        let screen: String = (0..b.area.height).map(|y| row_text(&b, y) + "\n").collect();
+        assert!(screen.contains(" Colors ") && screen.contains(" Layers ") && screen.contains(" + New "));
     }
 
     #[test]

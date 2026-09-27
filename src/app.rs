@@ -10,12 +10,14 @@ use crate::document::{Document, PxRect, Rgba};
 use crate::history::{Changed, Edit, History};
 use crate::icon;
 use crate::kitty::{Graphics, Z_BELOW_BG};
+use crate::picker::{self, Part};
 use crate::stroke::{self, BrushSpec, Mode, Operation};
 use crate::tiles::Tiles;
 use crate::viewport::Viewport;
 
 pub const CURSOR_IMAGE: u32 = 0x7470_0002;
 pub const ICON_IMAGE: u32 = 0x7470_0003;
+pub const CANVAS_TILES: u32 = 0x7470_1000;
 /// Canvas tiles and the cursor live below cells with a non-default background, so any
 /// ratatui widget with a background colour (panels, popups) occludes them,
 /// while the empty default-background cells of the canvas area show them.
@@ -113,18 +115,6 @@ impl Param {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Slider {
-    R,
-    G,
-    B,
-    A,
-    H,
-    S,
-    V,
-    LayerOpacity,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Tool(Tool),
     Param(Param, i32),
@@ -138,9 +128,12 @@ pub enum Action {
     ZoomIn,
     ZoomOut,
     ZoomFit,
-    Swatch(usize),
     Swap,
-    Slider(Slider),
+    /// The colour picker; which part was hit is resolved in pixels.
+    Picker,
+    /// Set the primary colour's opacity (percent).
+    Alpha(u8),
+    LayerOpacity,
     LayerSelect(usize),
     LayerToggle(usize),
     LayerAdd,
@@ -161,19 +154,11 @@ pub enum Popup {
     About,
     Rename(String),
     ConfirmQuit,
+    /// Opacity presets dropped down from the colour picker.
+    AlphaMenu,
 }
 
-pub const PALETTE: [u32; 32] = [
-    0x000000, 0x3f3f46, 0x71717a, 0xa1a1aa, 0xd4d4d8, 0xffffff, 0x7f1d1d, 0xef4444, //
-    0xf97316, 0xfbbf24, 0xfde047, 0xa3e635, 0x22c55e, 0x14532d, 0x2dd4bf, 0x0e7490, //
-    0x38bdf8, 0x3b82f6, 0x1e3a8a, 0x6366f1, 0xa855f7, 0x6b21a8, 0xec4899, 0xf9a8d4, //
-    0xfecaca, 0xfed7aa, 0xfef3c7, 0xd9f99d, 0xbbf7d0, 0xbae6fd, 0xddd6fe, 0x78350f,
-];
-
-pub fn palette_color(i: usize) -> Rgba {
-    let c = PALETTE[i];
-    Rgba([(c >> 16) as u8, (c >> 8) as u8, c as u8, 255])
-}
+pub const ALPHA_PRESETS: [u8; 5] = [100, 75, 50, 25, 0];
 
 /// Timing / bandwidth of the last rendered frame.
 #[derive(Default, Clone, Copy)]
@@ -182,7 +167,7 @@ pub struct FrameStats {
     pub ms: f32,
     /// Bytes written to the terminal.
     pub bytes: usize,
-    /// Canvas pixels re-sent.
+    /// Canvas and colour picker pixels re-sent.
     pub px: usize,
 }
 
@@ -219,6 +204,11 @@ pub struct App {
     /// Blank cells reserved for the icon in the About dialog (set by the UI
     /// each frame; `None` when the dialog is closed or too small for it).
     pub about_icon: Option<Rect>,
+    /// Colour picker geometry (set by the UI each frame; `None` when the
+    /// panel is too small for it).
+    pub picker: Option<picker::Layout>,
+    /// Hex digits typed into the picker's colour field while it is edited.
+    pub hex_edit: Option<String>,
     pub hits: Vec<(Rect, Action)>,
     pub popup: Option<Popup>,
     pub path: PathBuf,
@@ -235,7 +225,11 @@ pub struct App {
     status: String,
     status_at: Instant,
     op: Option<ActiveOp>,
-    slider_drag: Option<(Slider, Rect)>,
+    /// Layer opacity slider being dragged.
+    slider_drag: Option<Rect>,
+    /// Picker ring, triangle or opacity slider being dragged.
+    picker_drag: Option<Part>,
+    picker_gfx: Option<picker::Gfx>,
     mouse_px: Option<(i32, i32)>,
     /// Document regions changed since the last frame.
     doc_dirty: Vec<PxRect>,
@@ -270,6 +264,8 @@ impl App {
             cell,
             canvas_cells: Rect::default(),
             about_icon: None,
+            picker: None,
+            hex_edit: None,
             hits: Vec::new(),
             popup: None,
             path,
@@ -284,6 +280,8 @@ impl App {
             status_at: Instant::now(),
             op: None,
             slider_drag: None,
+            picker_drag: None,
+            picker_gfx: None,
             mouse_px: None,
             doc_dirty: Vec::new(),
             view_full: false,
@@ -334,56 +332,39 @@ impl App {
         self.hsv = rgb_to_hsv(c);
     }
 
-    pub fn slider_value(&self, s: Slider) -> f32 {
-        let [r, g, b, a] = self.primary.0;
-        match s {
-            Slider::R => r as f32 / 255.0,
-            Slider::G => g as f32 / 255.0,
-            Slider::B => b as f32 / 255.0,
-            Slider::A => a as f32 / 255.0,
-            Slider::H => self.hsv.0 / 360.0,
-            Slider::S => self.hsv.1,
-            Slider::V => self.hsv.2,
-            Slider::LayerOpacity => self.doc.layers[self.doc.active].opacity as f32 / 100.0,
-        }
+    /// Set the primary colour from HSV, keeping its opacity.
+    fn set_hsv(&mut self, hsv: (f32, f32, f32)) {
+        self.hsv = hsv;
+        let mut c = hsv_to_rgb(hsv);
+        c.0[3] = self.primary.0[3];
+        self.primary = c;
     }
 
-    fn set_slider(&mut self, s: Slider, v: f32) {
-        let v = v.clamp(0.0, 1.0);
-        let b = (v * 255.0).round() as u8;
-        match s {
-            Slider::R | Slider::G | Slider::B | Slider::A => {
-                let k = match s {
-                    Slider::R => 0,
-                    Slider::G => 1,
-                    Slider::B => 2,
-                    _ => 3,
-                };
-                let mut c = self.primary;
-                c.0[k] = b;
-                if k == 3 {
-                    self.primary = c;
-                } else {
-                    self.set_primary(c);
-                }
-            }
-            Slider::H | Slider::S | Slider::V => {
-                match s {
-                    Slider::H => self.hsv.0 = v * 360.0,
-                    Slider::S => self.hsv.1 = v,
-                    _ => self.hsv.2 = v,
-                }
-                let mut c = hsv_to_rgb(self.hsv);
-                c.0[3] = self.primary.0[3];
-                self.primary = c;
-            }
-            Slider::LayerOpacity => {
-                let a = self.doc.active;
-                self.doc.layers[a].opacity = (v * 100.0).round() as u8;
-                self.invalidate_doc(self.doc.bounds());
-                self.modified = true;
-            }
-        }
+    /// Opacity of the primary colour in percent.
+    pub fn alpha_percent(&self) -> u8 {
+        (self.primary.0[3] as f32 / 2.55).round() as u8
+    }
+
+    fn set_alpha_percent(&mut self, p: i32) {
+        self.primary.0[3] = (p.clamp(0, 100) as f32 * 2.55).round() as u8;
+    }
+
+    /// Hue in degrees and HSL saturation / lightness in percent of the
+    /// primary colour, as shown in the picker.
+    pub fn hsl_readout(&self) -> (u16, u16, u16) {
+        let (_, s, l) = hsv_to_hsl(self.hsv);
+        ((self.hsv.0.round() as u16) % 360, (s * 100.0).round() as u16, (l * 100.0).round() as u16)
+    }
+
+    pub fn layer_opacity(&self) -> f32 {
+        self.doc.layers[self.doc.active].opacity as f32 / 100.0
+    }
+
+    fn set_layer_opacity(&mut self, v: f32) {
+        let a = self.doc.active;
+        self.doc.layers[a].opacity = (v.clamp(0.0, 1.0) * 100.0).round() as u8;
+        self.invalidate_doc(self.doc.bounds());
+        self.modified = true;
     }
 
     // ------------------------------------------------------------------
@@ -482,13 +463,16 @@ impl App {
                 self.view.fit(&self.doc);
                 self.invalidate_view();
             }
-            Action::Swatch(i) => self.set_primary(palette_color(i)),
             Action::Swap => {
                 let p = self.primary;
                 self.set_primary(self.secondary);
                 self.secondary = p;
             }
-            Action::Slider(_) => {}
+            Action::Picker | Action::LayerOpacity => {}
+            Action::Alpha(p) => {
+                self.set_alpha_percent(p as i32);
+                self.popup = None;
+            }
             Action::LayerSelect(i) => self.doc.active = i,
             Action::LayerToggle(i) => {
                 self.doc.layers[i].visible = !self.doc.layers[i].visible;
@@ -597,9 +581,26 @@ impl App {
                     KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('n') => self.popup = None,
                     _ => {}
                 },
-                Popup::Help | Popup::About => self.popup = None,
+                Popup::Help | Popup::About | Popup::AlphaMenu => self.popup = None,
             }
             return;
+        }
+        // The hex field takes plain keys while it is edited (hex digits
+        // double as tool shortcuts); Ctrl shortcuts abandon the edit.
+        if let Some(s) = &mut self.hex_edit {
+            if !ctrl {
+                match k.code {
+                    KeyCode::Enter => self.commit_hex(),
+                    KeyCode::Esc => self.hex_edit = None,
+                    KeyCode::Backspace => {
+                        s.pop();
+                    }
+                    KeyCode::Char(c) if c.is_ascii_hexdigit() && s.len() < 8 => s.push(c.to_ascii_uppercase()),
+                    _ => {}
+                }
+                return;
+            }
+            self.hex_edit = None;
         }
         if ctrl {
             match k.code {
@@ -689,11 +690,101 @@ impl App {
         self.hits.iter().rev().find(|(r, _)| r.contains(pos)).copied()
     }
 
-    fn slider_from_col(&mut self, s: Slider, r: Rect, px: i32) {
+    fn slider_from_col(&mut self, r: Rect, px: i32) {
         // Use pixel precision inside the slider for smooth values.
         let x0 = r.x as f32 * self.cell.0 as f32;
         let w = (r.width as f32 * self.cell.0 as f32 - 1.0).max(1.0);
-        self.set_slider(s, (px as f32 - x0) / w);
+        self.set_layer_opacity((px as f32 - x0) / w);
+    }
+
+    fn picker_part(&self, m: (i32, i32)) -> Option<Part> {
+        self.picker.and_then(|l| l.part_at(m))
+    }
+
+    fn picker_down(&mut self, btn: MouseButton, m: (i32, i32)) {
+        let Some(part) = self.picker_part(m) else { return };
+        let right = btn == MouseButton::Right;
+        match part {
+            Part::Ring | Part::Triangle | Part::Alpha => {
+                self.picker_drag = Some(part);
+                self.picker_drag_to(part, m);
+            }
+            // Clicking the colour behind brings it to the front.
+            Part::Secondary | Part::Swap => self.perform(Action::Swap),
+            Part::Transparent => {
+                if right {
+                    self.secondary.0[3] = 0;
+                } else {
+                    self.primary.0[3] = 0;
+                }
+            }
+            Part::Black | Part::White => {
+                let c = if part == Part::Black { Rgba::BLACK } else { Rgba::WHITE };
+                if right {
+                    self.secondary = c;
+                } else {
+                    self.set_primary(c);
+                }
+            }
+            Part::Hex => {
+                if self.hex_edit.is_none() {
+                    self.hex_edit = Some(String::new());
+                }
+            }
+            Part::AlphaField | Part::AlphaMenu => self.popup = Some(Popup::AlphaMenu),
+            Part::Primary | Part::Hue | Part::Saturation | Part::Lightness => {}
+        }
+    }
+
+    fn picker_drag_to(&mut self, part: Part, m: (i32, i32)) {
+        let Some(l) = self.picker else { return };
+        let (h, s, v) = self.hsv;
+        match part {
+            Part::Ring => self.set_hsv((l.hue_at(m), s, v)),
+            Part::Triangle => {
+                let (ns, nv) = l.sv_at(m, h);
+                self.set_hsv((h, ns.unwrap_or(s), nv));
+            }
+            Part::Alpha => self.primary.0[3] = l.alpha_at(m),
+            _ => {}
+        }
+    }
+
+    /// Mouse wheel over the picker fine-tunes the value under the pointer.
+    fn picker_scroll(&mut self, d: i32, m: (i32, i32)) {
+        let (h, s, v) = self.hsv;
+        let step = d as f32 / 100.0;
+        match self.picker_part(m) {
+            Some(Part::Ring | Part::Hue) => self.set_hsv(((h + d as f32).rem_euclid(360.0), s, v)),
+            Some(Part::Triangle) => self.set_hsv((h, s, (v + step).clamp(0.0, 1.0))),
+            Some(part @ (Part::Saturation | Part::Lightness)) => {
+                let (_, mut hs, mut hl) = hsv_to_hsl(self.hsv);
+                if part == Part::Saturation {
+                    hs = (hs + step).clamp(0.0, 1.0);
+                } else {
+                    hl = (hl + step).clamp(0.0, 1.0);
+                }
+                let (_, ns, nv) = hsl_to_hsv((h, hs, hl));
+                // Saturation is undefined at black; keep the old one.
+                self.set_hsv((h, if nv > 0.0 { ns } else { s }, nv));
+            }
+            Some(Part::Alpha | Part::AlphaField | Part::AlphaMenu) => self.set_alpha_percent(self.alpha_percent() as i32 + d),
+            _ => {}
+        }
+    }
+
+    /// Apply the digits typed into the hex field: 3 or 6 set the colour and
+    /// keep its opacity, 8 set the opacity too. Empty leaves it unchanged.
+    fn commit_hex(&mut self) {
+        let Some(s) = self.hex_edit.take() else { return };
+        if s.is_empty() {
+            return;
+        }
+        match parse_hex(&s, self.primary.0[3]) {
+            Some(c) if c == self.primary => {}
+            Some(c) => self.set_primary(c),
+            None => self.set_status(format!("Not a colour: #{s} (use 3, 6 or 8 hex digits)")),
+        }
     }
 
     /// `ev.column`/`ev.row` are *pixel* coordinates (SGR-Pixels mode 1016).
@@ -719,7 +810,7 @@ impl App {
                     match self.hit(cell) {
                         Some((_, a)) => self.perform(a),
                         None => {
-                            if matches!(self.popup, Some(Popup::Help | Popup::About)) {
+                            if matches!(self.popup, Some(Popup::Help | Popup::About | Popup::AlphaMenu)) {
                                 self.popup = None;
                             }
                         }
@@ -729,13 +820,17 @@ impl App {
                 if self.op.is_some() {
                     return;
                 }
+                // Clicking anywhere but the hex field applies what was typed.
+                if self.hex_edit.is_some() && self.picker_part((mx, my)) != Some(Part::Hex) {
+                    self.commit_hex();
+                }
                 if let Some((r, a)) = self.hit(cell) {
                     match a {
-                        Action::Slider(s) => {
-                            self.slider_drag = Some((s, r));
-                            self.slider_from_col(s, r, mx);
+                        Action::LayerOpacity => {
+                            self.slider_drag = Some(r);
+                            self.slider_from_col(r, mx);
                         }
-                        Action::Swatch(i) if btn == MouseButton::Right => self.secondary = palette_color(i),
+                        Action::Picker => self.picker_down(btn, (mx, my)),
                         Action::Param(p, d) if btn == MouseButton::Right => self.adjust_param(p, -d),
                         _ => self.perform(a),
                     }
@@ -744,14 +839,17 @@ impl App {
                 }
             }
             MouseEventKind::Drag(_) => {
-                if let Some((s, r)) = self.slider_drag {
-                    self.slider_from_col(s, r, mx);
+                if let Some(part) = self.picker_drag {
+                    self.picker_drag_to(part, (mx, my));
+                } else if let Some(r) = self.slider_drag {
+                    self.slider_from_col(r, mx);
                 } else {
                     self.canvas_drag(dp, (mx, my));
                 }
             }
             MouseEventKind::Up(_) => {
                 self.slider_drag = None;
+                self.picker_drag = None;
                 self.canvas_up();
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -769,10 +867,8 @@ impl App {
                 } else if let Some((_, a)) = self.hit(cell) {
                     match a {
                         Action::Param(p, _) => self.adjust_param(p, d),
-                        Action::Slider(s) => {
-                            let v = self.slider_value(s) + d as f32 / 100.0;
-                            self.set_slider(s, v);
-                        }
+                        Action::LayerOpacity => self.set_layer_opacity(self.layer_opacity() + d as f32 / 100.0),
+                        Action::Picker => self.picker_scroll(d, (mx, my)),
                         _ => {}
                     }
                 }
@@ -931,9 +1027,11 @@ impl App {
             g.delete_image(ICON_IMAGE);
             self.icon_placed = None;
         }
-        self.force_recreate = false;
+        let recreate = std::mem::replace(&mut self.force_recreate, false);
         self.sync_icon(g);
+        let picker_px = self.sync_picker(g, recreate);
         if w == 0 || h == 0 {
+            self.stats.px = picker_px;
             return;
         }
 
@@ -950,7 +1048,7 @@ impl App {
                     self.view_initialized = true;
                 }
                 self.view_full = true;
-                self.tiles.insert(Tiles::new(area, self.cell, self.tile_px))
+                self.tiles.insert(Tiles::new(area, self.cell, self.tile_px, CANVAS_TILES))
             }
         };
         if std::mem::take(&mut self.view_full) {
@@ -963,8 +1061,34 @@ impl App {
                 tiles.mark(vr);
             }
         }
-        self.stats.px = tiles.upload(&self.view, g, CANVAS_Z);
+        self.stats.px = tiles.upload(&self.view.buf, g, CANVAS_Z) + picker_px;
         self.sync_cursor(g);
+    }
+
+    fn picker_state(&self) -> picker::State {
+        let idle = self.popup.is_none() && self.picker_drag.is_none();
+        picker::State {
+            hsv: self.hsv,
+            primary: self.primary,
+            secondary: self.secondary,
+            hover: self.mouse_px.filter(|_| idle).and_then(|m| self.picker_part(m)).filter(|p| p.hoverable()),
+            editing: self.hex_edit.is_some(),
+            menu: matches!(self.popup, Some(Popup::AlphaMenu)),
+        }
+    }
+
+    /// Colour picker tiles: rebuilt when the layout changes, otherwise
+    /// re-rendered only when what they show changes. Returns pixels sent.
+    fn sync_picker(&mut self, g: &mut Graphics, recreate: bool) -> usize {
+        if (recreate || self.picker_gfx.as_ref().map(|p| p.layout) != self.picker)
+            && let Some(old) = self.picker_gfx.take()
+        {
+            old.delete(g);
+        }
+        let Some(layout) = self.picker else { return 0 };
+        let state = self.picker_state();
+        let tile_px = self.tile_px;
+        self.picker_gfx.get_or_insert_with(|| picker::Gfx::new(layout, tile_px)).sync(&state, g)
     }
 
     /// Brush outline drawn as a second, tiny Kitty image stacked above the
@@ -1060,6 +1184,9 @@ impl App {
         if let Some(t) = &self.tiles {
             t.delete_all(g);
         }
+        if let Some(p) = &self.picker_gfx {
+            p.delete(g);
+        }
         g.delete_image(CURSOR_IMAGE);
         g.delete_image(ICON_IMAGE);
     }
@@ -1139,6 +1266,29 @@ pub fn rgb_to_hsv(c: Rgba) -> (f32, f32, f32) {
     (h, s, max)
 }
 
+/// HSV → HSL (hue unchanged; saturation and lightness in 0..=1).
+pub fn hsv_to_hsl((h, s, v): (f32, f32, f32)) -> (f32, f32, f32) {
+    let l = v * (1.0 - s / 2.0);
+    let m = l.min(1.0 - l);
+    (h, if m > 0.0 { (v - l) / m } else { 0.0 }, l)
+}
+
+pub fn hsl_to_hsv((h, s, l): (f32, f32, f32)) -> (f32, f32, f32) {
+    let v = l + s * l.min(1.0 - l);
+    (h, if v > 0.0 { 2.0 * (1.0 - l / v) } else { 0.0 }, v)
+}
+
+/// `RGB`/`RRGGBB` (opacity `alpha`) or `RRGGBBAA`.
+fn parse_hex(s: &str, alpha: u8) -> Option<Rgba> {
+    let s: String = if s.len() == 3 { s.chars().flat_map(|c| [c, c]).collect() } else { s.into() };
+    let v = u32::from_str_radix(&s, 16).ok()?;
+    match s.len() {
+        6 => Some(Rgba([(v >> 16) as u8, (v >> 8) as u8, v as u8, alpha])),
+        8 => Some(Rgba([(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8])),
+        _ => None,
+    }
+}
+
 pub fn hsv_to_rgb((h, s, v): (f32, f32, f32)) -> Rgba {
     let c = v * s;
     let hp = (h.rem_euclid(360.0)) / 60.0;
@@ -1162,10 +1312,23 @@ mod tests {
 
     #[test]
     fn hsv_roundtrip() {
-        for c in PALETTE {
+        for c in [0x000000u32, 0x71717a, 0xffffff, 0x7f1d1d, 0xf97316, 0x22c55e, 0x0e7490, 0x6366f1, 0xf9a8d4, 0x78350f] {
             let rgb = Rgba([(c >> 16) as u8, (c >> 8) as u8, c as u8, 255]);
             assert_eq!(hsv_to_rgb(rgb_to_hsv(rgb)), rgb);
+            let (h, s, v) = rgb_to_hsv(rgb);
+            let (_, s2, v2) = hsl_to_hsv(hsv_to_hsl((h, s, v)));
+            assert!((s - s2).abs() < 1e-4 && (v - v2).abs() < 1e-4, "HSL round trip of {c:06x}");
         }
+        assert_eq!(hsv_to_hsl(rgb_to_hsv(Rgba([235, 235, 235, 255]))).2, 235.0 / 255.0);
+    }
+
+    #[test]
+    fn hex_parsing() {
+        assert_eq!(parse_hex("3366CC", 128), Some(Rgba([0x33, 0x66, 0xcc, 128])));
+        assert_eq!(parse_hex("F80", 255), Some(Rgba([0xff, 0x88, 0x00, 255])));
+        assert_eq!(parse_hex("11223344", 255), Some(Rgba([0x11, 0x22, 0x33, 0x44])));
+        assert_eq!(parse_hex("12345", 255), None);
+        assert_eq!(parse_hex("", 255), None);
     }
 
     /// Draw the UI, sync graphics and return the escape sequences sent.
@@ -1176,6 +1339,138 @@ mod tests {
         let mut out = Vec::new();
         g.flush_to(&mut out).unwrap();
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, (x, y): (i32, i32)) {
+        app.on_mouse(MouseEvent { kind, column: x as u16, row: y as u16, modifiers: KeyModifiers::NONE });
+    }
+
+    fn click(app: &mut App, btn: MouseButton, p: (i32, i32)) {
+        mouse(app, MouseEventKind::Down(btn), p);
+        mouse(app, MouseEventKind::Up(btn), p);
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// App after one frame, so the picker layout is known.
+    fn with_picker() -> (App, ratatui::Terminal<ratatui::backend::TestBackend>, picker::Layout) {
+        let mut app = App::new(Document::new(64, 64), "t.png".into(), (19, 42), 64);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        frame(&mut app, &mut term);
+        let l = app.picker.expect("picker fits");
+        (app, term, l)
+    }
+
+    /// Screen pixel of a point given relative to the ring centre.
+    fn wheel_px(l: &picker::Layout, dx: f32, dy: f32) -> (i32, i32) {
+        (
+            (l.area.x as u32 * l.cell.0) as i32 + (l.center.0 + dx) as i32,
+            (l.area.y as u32 * l.cell.1) as i32 + (l.center.1 + dy) as i32,
+        )
+    }
+
+    fn ring_px(l: &picker::Layout, deg: f32) -> (i32, i32) {
+        let r = (l.r_out + l.r_in) / 2.0;
+        wheel_px(l, r * deg.to_radians().cos(), r * deg.to_radians().sin())
+    }
+
+    fn cell_px(r: Rect) -> (i32, i32) {
+        (r.x as i32 * 19 + 5, r.y as i32 * 42 + 5)
+    }
+
+    #[test]
+    fn wheel_picks_saturation_value_then_hue() {
+        let (mut app, _, l) = with_picker();
+        assert_eq!(app.primary, Rgba::BLACK);
+        // Next to the pure-hue vertex of the triangle (red at hue 0).
+        click(&mut app, MouseButton::Left, wheel_px(&l, l.r_tri - 4.0, 0.0));
+        let [r, g, b, a] = app.primary.0;
+        assert!(r > 240 && g < 20 && b < 20 && a == 255, "{:?}", app.primary);
+
+        // Dragging round the ring turns it green, keeping saturation/value.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), ring_px(&l, 0.0));
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), ring_px(&l, 60.0));
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), wheel_px(&l, -0.5 * l.r_out, 0.866 * l.r_out));
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), ring_px(&l, 120.0));
+        assert!((app.hsv.0 - 120.0).abs() < 1.0, "hue {}", app.hsv.0);
+        let [r, g, b, _] = app.primary.0;
+        assert!(r < 20 && g > 240 && b < 20, "{:?}", app.primary);
+        assert!(!app.modified, "picking colours does not touch the document");
+    }
+
+    #[test]
+    fn hex_field_captures_typing() {
+        let (mut app, _, l) = with_picker();
+        app.tool = Tool::Pencil;
+        click(&mut app, MouseButton::Left, cell_px(l.hex));
+        assert_eq!(app.hex_edit.as_deref(), Some(""));
+        // b, e and f are tool shortcuts too.
+        for c in "bEef0".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Backspace);
+        for c in "00q".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.hex_edit.as_deref(), Some("BEEF00"));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!((app.primary, app.tool, app.quit), (Rgba([0xbe, 0xef, 0x00, 255]), Tool::Pencil, false));
+
+        // Clicking elsewhere applies the field; junk is rejected.
+        click(&mut app, MouseButton::Left, cell_px(l.hex));
+        key(&mut app, KeyCode::Char('1'));
+        key(&mut app, KeyCode::Char('2'));
+        click(&mut app, MouseButton::Left, cell_px(l.hsl[0]));
+        assert_eq!((app.hex_edit.as_deref(), app.primary), (None, Rgba([0xbe, 0xef, 0x00, 255])));
+        assert!(app.status().contains("#12"));
+    }
+
+    #[test]
+    fn opacity_menu_and_slider() {
+        let (mut app, mut term, l) = with_picker();
+        click(&mut app, MouseButton::Left, cell_px(l.menu));
+        assert!(matches!(app.popup, Some(Popup::AlphaMenu)));
+        frame(&mut app, &mut term);
+        let item = app.hits.iter().find(|(_, a)| *a == Action::Alpha(50)).map(|(r, _)| *r).expect("50% item");
+        click(&mut app, MouseButton::Left, cell_px(item));
+        assert_eq!((app.primary.0[3], app.alpha_percent()), (128, 50));
+        assert!(app.popup.is_none());
+        frame(&mut app, &mut term);
+
+        let track = |x: f32| wheel_px(&l, x - l.center.0, (l.track.y0 + l.track.y1) / 2.0 - l.center.1);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), track(l.track.x1 - 1.0));
+        assert_eq!(app.primary.0[3], 255);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), track(l.track.x0 - 50.0));
+        assert_eq!(app.primary.0[3], 0, "dragging past the end clamps");
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), track(l.track.x0));
+        mouse(&mut app, MouseEventKind::ScrollUp, cell_px(l.alpha));
+        assert_eq!(app.alpha_percent(), 1);
+    }
+
+    #[test]
+    fn swatches_swap_and_none() {
+        let (mut app, _, l) = with_picker();
+        let local = |x: f32, y: f32| wheel_px(&l, x - l.center.0, y - l.center.1);
+        click(&mut app, MouseButton::Left, local(l.white.x0 + 3.0, l.white.y0 + 3.0));
+        click(&mut app, MouseButton::Right, local(l.black.x0 + 3.0, l.black.y0 + 3.0));
+        assert_eq!((app.primary, app.secondary), (Rgba::WHITE, Rgba::BLACK));
+        click(&mut app, MouseButton::Left, local(l.secondary.x - 0.6 * l.secondary.r, l.secondary.y));
+        assert_eq!((app.primary, app.secondary), (Rgba::BLACK, Rgba::WHITE), "clicking the back colour swaps");
+        click(&mut app, MouseButton::Left, local(l.transparent.x, l.transparent.y));
+        assert_eq!(app.primary, Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn picker_hover_redraws_only_its_tiles() {
+        let (mut app, mut term, l) = with_picker();
+        assert!(frame(&mut app, &mut term).is_empty(), "idle frame sends nothing");
+        let white = wheel_px(&l, l.white.x0 + 3.0 - l.center.0, l.white.y0 + 3.0 - l.center.1);
+        mouse(&mut app, MouseEventKind::Moved, white);
+        let s = frame(&mut app, &mut term);
+        assert!(s.contains(&format!("i={}", picker::TILE_BASE)) || s.contains("a=T"), "hover redraws picker tiles");
+        assert!(!s.contains(&format!("i={CANVAS_TILES},")), "canvas untouched");
     }
 
     #[test]

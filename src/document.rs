@@ -45,6 +45,9 @@ pub struct Rgba(pub [u8; 4]);
 impl Rgba {
     pub const BLACK: Rgba = Rgba([0, 0, 0, 255]);
     pub const WHITE: Rgba = Rgba([255, 255, 255, 255]);
+    pub fn rgb(&self) -> [u8; 3] {
+        [self.0[0], self.0[1], self.0[2]]
+    }
     pub fn hex(&self) -> String {
         let [r, g, b, a] = self.0;
         if a == 255 { format!("#{r:02X}{g:02X}{b:02X}") } else { format!("#{r:02X}{g:02X}{b:02X}{a:02X}") }

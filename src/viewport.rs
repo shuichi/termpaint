@@ -108,14 +108,4 @@ impl Viewport {
             }
         }
     }
-
-    pub fn extract(&self, r: PxRect) -> Vec<u8> {
-        let vw = self.w as usize;
-        let mut out = Vec::with_capacity((r.width() * r.height() * 4) as usize);
-        for y in r.y0..r.y1 {
-            let s = (y as usize * vw + r.x0 as usize) * 4;
-            out.extend_from_slice(&self.buf[s..s + r.width() as usize * 4]);
-        }
-        out
-    }
 }

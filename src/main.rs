@@ -1,6 +1,7 @@
 //! termpaint — a bitmap paint program for the terminal.
 //!
-//! * UI chrome (toolbar, palette, layers, status) is a ratatui text UI.
+//! * UI chrome (toolbar, layers, status, labels) is a ratatui text UI.
+//! * The colour picker is a bitmap tiled under its text labels the same way.
 //! * The canvas is a grid of Kitty graphics protocol tiles placed under the
 //!   empty canvas cells with a z-index below non-default cell backgrounds,
 //!   so ratatui popups naturally occlude it. Only dirty tiles are re-sent.
@@ -12,6 +13,7 @@ mod history;
 mod icon;
 mod io;
 mod kitty;
+mod picker;
 mod stroke;
 mod tiles;
 mod ui;
@@ -147,7 +149,7 @@ fn main() -> Result<()> {
     } else {
         let (w, h) = opts.size.unwrap_or_else(|| {
             let (cols, rows) = terminal::size().unwrap_or((120, 40));
-            let c = ui::areas(Rect::new(0, 0, cols, rows)).canvas;
+            let c = ui::areas(Rect::new(0, 0, cols, rows), cell).canvas;
             let w = (c.width as u32 * cell.0).saturating_sub(4 * cell.0).clamp(64, 4096);
             let h = (c.height as u32 * cell.1).saturating_sub(2 * cell.1).clamp(64, 4096);
             (w, h)

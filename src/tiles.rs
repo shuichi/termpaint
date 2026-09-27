@@ -10,14 +10,13 @@ use ratatui::layout::Rect;
 
 use crate::document::PxRect;
 use crate::kitty::Graphics;
-use crate::viewport::Viewport;
-
-pub const TILE_BASE: u32 = 0x7470_1000;
 
 pub struct Tiles {
-    /// Canvas area in cells.
+    /// Area covered in cells; the bitmap is exactly this many cells big.
     pub area: Rect,
     pub cell: (u32, u32),
+    /// Image id of the first tile; tile `i` uses `id_base + i`.
+    id_base: u32,
     /// Tile size in cells.
     tc: u16,
     tr: u16,
@@ -27,12 +26,17 @@ pub struct Tiles {
 }
 
 impl Tiles {
-    pub fn new(area: Rect, cell: (u32, u32), target_px: u32) -> Self {
+    pub fn new(area: Rect, cell: (u32, u32), target_px: u32, id_base: u32) -> Self {
         let tc = ((target_px as f32 / cell.0 as f32).round() as u16).max(1);
         let tr = ((target_px as f32 / cell.1 as f32).round() as u16).max(1);
         let nx = area.width.div_ceil(tc);
         let ny = area.height.div_ceil(tr);
-        Self { area, cell, tc, tr, nx, ny, dirty: vec![true; nx as usize * ny as usize] }
+        Self { area, cell, id_base, tc, tr, nx, ny, dirty: vec![true; nx as usize * ny as usize] }
+    }
+
+    /// Bytes per row of the bitmap covering `area`.
+    fn stride(&self) -> usize {
+        self.area.width as usize * self.cell.0 as usize * 4
     }
 
     pub fn grid(&self) -> (u16, u16) {
@@ -77,8 +81,31 @@ impl Tiles {
         self.dirty.fill(true);
     }
 
-    /// Send every dirty tile; returns the number of pixels sent.
-    pub fn upload(&mut self, view: &Viewport, g: &mut Graphics, z: i32) -> usize {
+    /// Mark every tile whose pixels differ between two bitmaps of the area.
+    pub fn mark_changed(&mut self, old: &[u8], new: &[u8]) {
+        if old.len() != new.len() {
+            return self.mark_all();
+        }
+        let stride = self.stride();
+        for iy in 0..self.ny {
+            for ix in 0..self.nx {
+                let r = self.px_rect(ix, iy);
+                let (a, b) = (r.x0 as usize * 4, r.x1 as usize * 4);
+                let changed = (r.y0..r.y1).any(|y| {
+                    let o = y as usize * stride;
+                    old[o + a..o + b] != new[o + a..o + b]
+                });
+                if changed {
+                    self.dirty[iy as usize * self.nx as usize + ix as usize] = true;
+                }
+            }
+        }
+    }
+
+    /// Send every dirty tile of `buf` (a bitmap covering the area); returns
+    /// the number of pixels sent.
+    pub fn upload(&mut self, buf: &[u8], g: &mut Graphics, z: i32) -> usize {
+        let stride = self.stride();
         let mut px = 0;
         for iy in 0..self.ny {
             for ix in 0..self.nx {
@@ -87,9 +114,9 @@ impl Tiles {
                     continue;
                 }
                 let r = self.px_rect(ix, iy);
-                let data = view.extract(r);
+                let data = extract(buf, stride, r);
                 g.transmit_and_place(
-                    TILE_BASE + i as u32,
+                    self.id_base + i as u32,
                     1,
                     self.area.x + ix * self.tc,
                     self.area.y + iy * self.tr,
@@ -106,9 +133,19 @@ impl Tiles {
 
     pub fn delete_all(&self, g: &mut Graphics) {
         for i in 0..self.dirty.len() {
-            g.delete_image(TILE_BASE + i as u32);
+            g.delete_image(self.id_base + i as u32);
         }
     }
+}
+
+/// Copy rectangle `r` out of a bitmap with `stride` bytes per row.
+fn extract(buf: &[u8], stride: usize, r: PxRect) -> Vec<u8> {
+    let mut out = Vec::with_capacity((r.width() * r.height() * 4) as usize);
+    for y in r.y0..r.y1 {
+        let s = y as usize * stride + r.x0 as usize * 4;
+        out.extend_from_slice(&buf[s..s + r.width() as usize * 4]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -117,7 +154,7 @@ mod tests {
 
     #[test]
     fn tiles_cover_area_exactly() {
-        let t = Tiles::new(Rect::new(5, 2, 37, 19), (16, 32), 128);
+        let t = Tiles::new(Rect::new(5, 2, 37, 19), (16, 32), 128, 1);
         assert_eq!(t.grid(), (5, 5));
         let mut area = 0;
         for iy in 0..t.ny {
@@ -130,10 +167,23 @@ mod tests {
 
     #[test]
     fn mark_hits_only_overlapping_tiles() {
-        let mut t = Tiles::new(Rect::new(0, 0, 32, 16), (16, 32), 128);
+        let mut t = Tiles::new(Rect::new(0, 0, 32, 16), (16, 32), 128, 1);
         t.dirty.fill(false);
         t.mark(PxRect::new(120, 100, 140, 110));
         let marked: Vec<usize> = t.dirty.iter().enumerate().filter(|(_, d)| **d).map(|(i, _)| i).collect();
         assert_eq!(marked, vec![0, 1]);
+    }
+
+    #[test]
+    fn mark_changed_finds_only_differing_tiles() {
+        // 32×16 cells of 16×32 px → 4×4 tiles of 128 px.
+        let mut t = Tiles::new(Rect::new(0, 0, 32, 16), (16, 32), 128, 1);
+        t.dirty.fill(false);
+        let old = vec![0u8; 512 * 512 * 4];
+        let mut new = old.clone();
+        new[(300 * 512 + 200) * 4] = 1; // pixel (200, 300) → tile (1, 2)
+        t.mark_changed(&old, &new);
+        let marked: Vec<usize> = t.dirty.iter().enumerate().filter(|(_, d)| **d).map(|(i, _)| i).collect();
+        assert_eq!(marked, vec![2 * 4 + 1]);
     }
 }

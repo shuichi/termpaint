@@ -32,6 +32,63 @@ cargo run --release -- [FILE.png] [--size 1280x800] [--tile 64]
 
 kitty で実行してください（Ghostty・WezTermでも動くはずですが、未検証です）。ターミナルはピクセルサイズ（TIOCGWINSZ）を報告する必要があります。
 
+## ターミナルに要求する仕様
+
+```
+■ 必須（これが無いとキャンバスの描画・入力が成立しない）
+
+Kitty Graphics Protocol   画像の送信・配置・削除（APC ESC _G … ESC \）
+    a=t / a=T             画像の送信のみ / 送信して即配置（タイル単位で差し替え）
+    a=p                   既存画像の配置・移動
+    a=d, d=i / d=I        配置だけ削除 / 画像データごと削除
+    f=32, t=d             RGBA 32bit の生データを直接送信（t=d）
+    o=z                   zlib 圧縮したペイロード（--no-compress で無効化）
+    m=0/1                 4096 バイトごとのチャンク分割送信
+    i= / p=               画像 ID / 配置 ID（同じ ID で再送すると差し替え）
+    X= / Y=               セル内のピクセル単位オフセット
+    x,y,w,h               元画像の切り抜き
+    z=                    Z-index。負値（INT32_MIN/2 未満）で「背景色を持つセルの下」に描く
+    C=1                   配置してもカーソルを動かさない
+    q=2                   端末からの応答をすべて抑止
+
+DECSET 1016     SGR Pixel Mouse           マウス座標をセルではなくピクセル単位で報告
+DECSET 1006     SGR Mouse                 SGR 形式のマウス報告（1016 の前提）
+DECSET 1003     Any Event Mouse           ボタンを押していない移動も報告（ブラシカーソル表示）
+DECSET 1002     Button Event Mouse        ドラッグ中の移動を報告
+DECSET 1000     Normal Mouse Tracking     押下・解放・ホイールの報告
+
+TIOCGWINSZ      ws_xpixel / ws_ypixel     ウィンドウのピクセルサイズ（ioctl）。0 を返す端末では起動しない
+SIGWINCH                                  リサイズ通知（通知を受けたらセルのピクセルサイズを取り直す）
+
+■ 推奨（無くても動くが、ちらつきや表示崩れが出る）
+
+DECSET 2026     Synchronized Output       テキスト UI と画像の更新を 1 フレームにまとめて反映
+
+■ 標準的な VT／xterm 機能（ratatui・crossterm が使う）
+
+DECSET 1049     Alternate Screen          代替スクリーン（終了時に元の画面へ戻す）
+DECTCEM (DECSET 25)  Cursor Visibility    カーソルの非表示・再表示
+DECSET 1015     urxvt Mouse               crossterm が一緒に有効化するだけで、実際には 1006 を使う
+CUP  (CSI n;m H)                          カーソル位置指定（画像の配置先にも使う）
+ED   (CSI 2J)                             画面全体の消去
+SGR 38;2 / 48;2                           24bit トゥルーカラーの前景色・背景色
+SGR 1                                     太字
+SGR 0                                     属性リセット
+Unicode                                   罫線（│ ─ と角丸・二重線の枠）、░ ● ▲ ▼ ·
+termios raw mode                          非カノニカル入力（ioctl。エスケープシーケンスではない）
+
+■ 使っていないもの
+
+Kitty Keyboard Protocol   キーボード拡張フラグは設定していない。従来のキー入力で動く
+Sixel                     不使用
+DECRQM / DECRPM           不使用（機能の問い合わせをしない）
+DA1 / XTGETTCAP           不使用
+OSC 7 / 8 / 52 / 133      不使用（クリップボード連携などもしていない）
+```
+
+- 対応端末かどうかは、機能を問い合わせずに環境変数で判定しています。`TERM` に kitty か ghostty を含む、`KITTY_WINDOW_ID` がある、`TERM_PROGRAM` が ghostty か wezterm、のどれかに当てはまれば対応端末とみなします。判定を無視して起動するには `--force` を付けます。Kitty Graphics のコマンドにも `q=2` を付けているので、端末が本当に対応しているかは実行時に確かめていません。
+- 一番厳しい条件は負の z-index です。「背景色を持つセルの下に画像を描く」という Kitty 独自の仕様に頼って、ポップアップがキャンバスを隠せるようにしています（[描画の仕組み](#描画の仕組み)）。Kitty Graphics に対応していても、ここを正しく実装していない端末では重なり方が崩れます。
+
 ## 描画の仕組み
 
 | レイヤー | 内容 | z-index |

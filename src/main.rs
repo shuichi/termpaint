@@ -39,7 +39,8 @@ termpaint — pixel-precise bitmap painting in Kitty-compatible terminals
 USAGE:
     termpaint [FILE.png] [OPTIONS]
 
-    FILE.png            Open this PNG (if it exists) and save to it (default: untitled.png)
+    FILE.png            Open this PNG (if it exists) and save to it (default: untitled.png).
+                        Layers are kept in a private PNG chunk and restored on open.
 
 OPTIONS:
     --size WxH          Canvas size for a new image (default: fits the window)
@@ -141,9 +142,8 @@ fn main() -> Result<()> {
     }
     let mut cell = cell_size()?;
 
-    let doc = if opts.path.exists() {
-        let (w, h, px) = io::load_png(&opts.path)?;
-        Document::from_rgba(w, h, px)
+    let (doc, load_note) = if opts.path.exists() {
+        io::load_document(&opts.path)?
     } else {
         let (w, h) = opts.size.unwrap_or_else(|| {
             let (cols, rows) = terminal::size().unwrap_or((120, 40));
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
             let h = (c.height as u32 * cell.1).saturating_sub(2 * cell.1).clamp(64, 4096);
             (w, h)
         });
-        Document::new(w, h)
+        (Document::new(w, h), None)
     };
 
     let guard = TermGuard::enter()?;
@@ -168,6 +168,9 @@ fn main() -> Result<()> {
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
     term.clear()?;
     let mut app = App::new(doc, opts.path, cell, opts.tile_px);
+    if let Some(note) = load_note {
+        app.set_status(note);
+    }
     let result = run(&mut term, &mut app, &mut cell, opts.compress);
 
     let mut g = Graphics::new(false);

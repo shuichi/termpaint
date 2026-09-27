@@ -131,8 +131,27 @@ impl Document {
         d
     }
 
+    /// Rebuild a saved document. `layers` is bottom-most first and non-empty.
+    pub fn from_layers(width: u32, height: u32, layers: Vec<Layer>, active: usize, layer_counter: u32) -> Self {
+        let mut d = Self {
+            width,
+            height,
+            active: active.min(layers.len() - 1),
+            layers,
+            composite: vec![0; (width * height * 4) as usize],
+            layer_counter,
+        };
+        d.recomposite(d.bounds());
+        d
+    }
+
     pub fn bounds(&self) -> PxRect {
         PxRect::new(0, 0, self.width as i32, self.height as i32)
+    }
+
+    /// Number behind the most recent automatic "Layer N" name.
+    pub fn layer_counter(&self) -> u32 {
+        self.layer_counter
     }
 
     pub fn next_layer_name(&mut self) -> String {

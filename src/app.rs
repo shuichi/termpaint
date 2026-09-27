@@ -493,6 +493,7 @@ impl App {
             Action::LayerToggle(i) => {
                 self.doc.layers[i].visible = !self.doc.layers[i].visible;
                 self.invalidate_doc(self.doc.bounds());
+                self.modified = true;
             }
             Action::LayerAdd => {
                 let layer = self.doc.blank_layer();
@@ -554,9 +555,10 @@ impl App {
             Action::PopupOk => {
                 if let Some(Popup::Rename(name)) = self.popup.take() {
                     let name = name.trim();
-                    if !name.is_empty() {
-                        let a = self.doc.active;
+                    let a = self.doc.active;
+                    if !name.is_empty() && name != self.doc.layers[a].name {
                         self.doc.layers[a].name = name.to_string();
+                        self.modified = true;
                     }
                 }
             }
@@ -564,7 +566,7 @@ impl App {
     }
 
     fn save(&mut self) {
-        match crate::io::save_png(&self.path, self.doc.width, self.doc.height, &self.doc.flatten()) {
+        match crate::io::save_document(&self.path, &self.doc) {
             Ok(()) => {
                 self.modified = false;
                 self.set_status(format!("Saved {}", self.path.display()));
